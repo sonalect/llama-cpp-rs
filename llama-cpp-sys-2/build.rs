@@ -176,7 +176,15 @@ fn extract_lib_assets(out_dir: &Path, target_os: &TargetOs) -> Vec<PathBuf> {
     debug_log!("Extract lib assets {}", pattern.display());
     let mut files = Vec::new();
 
-    for entry in glob(pattern.to_str().unwrap()).unwrap() {
+    // On Linux, a shared library is a chain of symlinks with the version after the
+    // suffix (`libllama.so -> libllama.so.0 -> libllama.so.0.6.0`): the trailing `*`
+    // takes every link of it. On macOS, the version comes before the suffix
+    // (`libllama.0.dylib`), so the pattern already does.
+    let versions = match target_os {
+        TargetOs::Linux | TargetOs::Android => "*",
+        _ => "",
+    };
+    for entry in glob(&format!("{}{versions}", pattern.to_str().unwrap())).unwrap() {
         match entry {
             Ok(path) => {
                 files.push(path);
@@ -186,6 +194,24 @@ fn extract_lib_assets(out_dir: &Path, target_os: &TargetOs) -> Vec<PathBuf> {
     }
 
     files
+}
+
+/// Copy the shared library `src` to `dst`, replacing whatever is there.
+///
+/// A symlink is recreated with the same relative target, so that the chain resolves at
+/// the destination once all its links are copied (whether `hard_link` follows a symlink
+/// depends on the platform). A file is hard-linked, or copied when the destination is on
+/// another file system. The destination is looked at without following links, so that a
+/// dangling link left by an earlier build is replaced too.
+fn copy_lib_asset(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if dst.symlink_metadata().is_ok() {
+        std::fs::remove_file(dst)?;
+    }
+    #[cfg(unix)]
+    if src.symlink_metadata()?.file_type().is_symlink() {
+        return std::os::unix::fs::symlink(std::fs::read_link(src)?, dst);
+    }
+    std::fs::hard_link(src, dst).or_else(|_| std::fs::copy(src, dst).map(|_| ()))
 }
 
 fn library_file_exists(
@@ -1540,32 +1566,31 @@ fn main() {
     }
 
     // copy DLLs to target
-    if build_shared_libs {
-        let libs_assets = extract_lib_assets(&out_dir, &target_os);
-        for asset in libs_assets {
-            let asset_clone = asset.clone();
-            let filename = asset_clone.file_name().unwrap();
-            let filename = filename.to_str().unwrap();
-            let dst = target_dir.join(filename);
-            debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
-            if !dst.exists() {
-                std::fs::hard_link(asset.clone(), dst).unwrap();
-            }
-
-            // Copy DLLs to examples as well
-            if target_dir.join("examples").exists() {
-                let dst = target_dir.join("examples").join(filename);
-                debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
-                if !dst.exists() {
-                    std::fs::hard_link(asset.clone(), dst).unwrap();
+    //
+    // Only into a Cargo profile directory, the one that holds `deps`. Other build
+    // systems lay out OUT_DIR differently (Bazel has no `deps` there) and want build
+    // scripts to write nowhere else. A failed copy is only a warning: `cargo run` and
+    // `cargo test` find the libraries through the search paths given above as well.
+    if build_shared_libs && target_dir.join("deps").is_dir() {
+        // Copy DLLs to target/profile/deps for tests, and to examples as well
+        let mut dst_dirs = vec![target_dir.clone(), target_dir.join("deps")];
+        if target_dir.join("examples").is_dir() {
+            dst_dirs.push(target_dir.join("examples"));
+        }
+        for asset in extract_lib_assets(&out_dir, &target_os) {
+            let Some(filename) = asset.file_name() else {
+                continue;
+            };
+            for dst_dir in &dst_dirs {
+                let dst = dst_dir.join(filename);
+                debug_log!("COPY {} TO {}", asset.display(), dst.display());
+                if let Err(e) = copy_lib_asset(&asset, &dst) {
+                    println!(
+                        "cargo:warning=could not copy {} to {}: {e}",
+                        asset.display(),
+                        dst.display()
+                    );
                 }
-            }
-
-            // Copy DLLs to target/profile/deps as well for tests
-            let dst = target_dir.join("deps").join(filename);
-            debug_log!("HARD LINK {} TO {}", asset.display(), dst.display());
-            if !dst.exists() {
-                std::fs::hard_link(asset.clone(), dst).unwrap();
             }
         }
     }
